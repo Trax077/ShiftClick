@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Build output
+build/
+dist/
+
+# PyInstaller
+*.spec
+
+# Local app config
+shiftclick_config.json
+
+# IDE
+.vscode/
+.idea/
