@@ -21,8 +21,8 @@ APP_AUTHOR = "Trax077"
 DEFAULT_INTERVAL_MS = 50
 DEFAULT_ARMED = False
 DEFAULT_MODE = "hold"
-DEFAULT_WINDOW_WIDTH = 560
-DEFAULT_WINDOW_HEIGHT = 560
+DEFAULT_WINDOW_WIDTH = 680
+DEFAULT_WINDOW_HEIGHT = 600
 WINDOW_TITLE = f"ShiftClick {APP_VERSION} by {APP_AUTHOR}"
 TEST_STATS_REFRESH_MS = 100
 
@@ -257,8 +257,8 @@ class ShiftClickApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        outer.columnconfigure(0, weight=3)
-        outer.columnconfigure(1, weight=2)
+        outer.columnconfigure(0, weight=4)
+        outer.columnconfigure(1, weight=3)
         outer.rowconfigure(1, weight=1)
 
         controls_frame = ttk.LabelFrame(outer, text="Controls", style="Section.TLabelframe")
@@ -271,7 +271,7 @@ class ShiftClickApp:
             controls_frame,
             from_=0,
             to=999999,
-            width=18,
+            width=14,
             textvariable=self.interval_var,
             justify="right",
             font=tkfont.nametofont("TkTextFont"),
@@ -313,7 +313,7 @@ class ShiftClickApp:
         self.toggle_radio.grid(row=0, column=1, sticky="w")
 
         info_text = "Hotkey: Shift + Left Mouse Button\nToggle mode: plain LMB stops active autoclick"
-        info_label = ttk.Label(controls_frame, text=info_text, justify="left", wraplength=300, style="Muted.TLabel")
+        info_label = ttk.Label(controls_frame, text=info_text, justify="left", wraplength=360, style="Muted.TLabel")
         info_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         status_frame = ttk.LabelFrame(outer, text="Status", style="Section.TLabelframe")
@@ -330,27 +330,28 @@ class ShiftClickApp:
             style="Status.TLabel",
             relief="sunken",
             anchor="center",
-            width=16,
+            width=18,
         )
         status_label.grid(row=1, column=0, sticky="ew")
 
         stats_frame = ttk.LabelFrame(status_frame, text="Live Stats", padding=(12, 10))
         stats_frame.grid(row=2, column=0, sticky="ew", pady=(14, 0))
         stats_frame.columnconfigure(0, weight=1)
-        stats_frame.columnconfigure(1, weight=1)
 
-        self.sent_label = ttk.Label(stats_frame, textvariable=self.sent_var, style="Stats.TLabel", width=18, anchor="w")
-        self.sent_label.grid(row=0, column=0, sticky="w", padx=(0, 10), pady=(0, 6))
-        self.received_label = ttk.Label(stats_frame, textvariable=self.received_var, style="Stats.TLabel", width=18, anchor="w")
-        self.received_label.grid(row=0, column=1, sticky="w", pady=(0, 6))
+        self.sent_label = ttk.Label(stats_frame, textvariable=self.sent_var, style="Stats.TLabel", width=22, anchor="w")
+        self.sent_label.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self.received_label = ttk.Label(
+            stats_frame, textvariable=self.received_var, style="Stats.TLabel", width=22, anchor="w"
+        )
+        self.received_label.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         self.current_cps_label = ttk.Label(
-            stats_frame, textvariable=self.current_cps_var, style="Stats.TLabel", width=18, anchor="w"
+            stats_frame, textvariable=self.current_cps_var, style="Stats.TLabel", width=22, anchor="w"
         )
-        self.current_cps_label.grid(row=1, column=0, sticky="w", padx=(0, 10))
+        self.current_cps_label.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         self.peak_cps_label = ttk.Label(
-            stats_frame, textvariable=self.peak_cps_var, style="Stats.TLabel", width=18, anchor="w"
+            stats_frame, textvariable=self.peak_cps_var, style="Stats.TLabel", width=22, anchor="w"
         )
-        self.peak_cps_label.grid(row=1, column=1, sticky="w")
+        self.peak_cps_label.grid(row=3, column=0, sticky="ew")
 
         test_frame = ttk.LabelFrame(outer, text="Click Test", style="Section.TLabelframe")
         test_frame.grid(row=1, column=0, columnspan=2, sticky="nsew")
@@ -360,7 +361,7 @@ class ShiftClickApp:
         ttk.Label(
             test_frame,
             text="Move the cursor over the area below and start autoclicking to measure delivered clicks.",
-            wraplength=500,
+            wraplength=620,
             justify="left",
             style="Muted.TLabel",
         ).grid(row=0, column=0, sticky="w", pady=(0, 12))
