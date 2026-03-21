@@ -10,7 +10,7 @@ ShiftClick is a small Windows-only Python autoclicker with a simple `tkinter` GU
 - Configurable click interval in milliseconds
 - `0 ms` option for maximum possible speed
 - Status indicator: `DISARMED`, `ARMED`, `CLICKING`
-- Persistent settings in `shiftclick_config.json`
+- Persistent settings in `%APPDATA%\ShiftClick\config.json`
 
 ## Behavior
 

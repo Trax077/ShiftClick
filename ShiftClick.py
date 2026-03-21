@@ -1,6 +1,7 @@
 import ctypes
 import importlib
 import json
+import os
 import queue
 import sys
 import threading
@@ -10,12 +11,13 @@ import tkinter.font as tkfont
 from collections import deque
 from pathlib import Path
 from tkinter import messagebox, ttk
+from typing import SupportsInt
 
 
-CONFIG_FILE = Path(__file__).with_name("shiftclick_config.json")
+CONFIG_FILE = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "ShiftClick" / "config.json"
 ICON_FILE = "shiftclick_mouse.ico"
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 APP_AUTHOR = "Trax077"
 DEFAULT_INTERVAL_MS = 50
@@ -31,8 +33,10 @@ class PynputImportError(RuntimeError):
     """Raised when pynput is not available."""
 
 
-def normalize_interval(value):
+def normalize_interval(value: str | SupportsInt | None) -> int:
     """Convert user input to a safe non-negative click interval."""
+    if value is None:
+        return DEFAULT_INTERVAL_MS
     try:
         interval = int(value)
     except (TypeError, ValueError):
@@ -40,12 +44,12 @@ def normalize_interval(value):
     return max(0, interval)
 
 
-def normalize_mode(value):
+def normalize_mode(value: str | None) -> str:
     """Ensure mode stays within the supported values."""
     return value if value in {"hold", "toggle"} else DEFAULT_MODE
 
 
-def compute_status(armed, clicking_active):
+def compute_status(armed: bool, clicking_active: bool) -> str:
     """Map internal state to the UI status text."""
     if clicking_active:
         return "CLICKING"
@@ -54,13 +58,13 @@ def compute_status(armed, clicking_active):
     return "DISARMED"
 
 
-def is_injected_mouse_event(data):
+def is_injected_mouse_event(data: object) -> bool:
     """Return True for mouse events injected by software on Windows."""
     flags = getattr(data, "flags", 0)
     return bool(flags & 0x00000001 or flags & 0x00000002)
 
 
-def normalize_geometry(geometry):
+def normalize_geometry(geometry: object) -> str | None:
     """Prevent restored window geometry from shrinking below the intended UI size."""
     if not isinstance(geometry, str):
         return None
@@ -210,6 +214,7 @@ class ShiftClickApp:
         self._start_global_listeners()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(0, self._restore_geometry)
         self.root.after(50, self._process_gui_queue)
         self.root.after(TEST_STATS_REFRESH_MS, self._refresh_test_stats)
 
@@ -225,10 +230,9 @@ class ShiftClickApp:
         default_font = tkfont.nametofont("TkDefaultFont")
         text_font = tkfont.nametofont("TkTextFont")
         heading_font = default_font.copy()
-        bold_font = default_font.copy()
         heading_font.configure(size=default_font.cget("size") + 1, weight="bold")
-        bold_font.configure(size=default_font.cget("size") + 1, weight="bold")
 
+        # Increase the Tk-wide singleton fonts once for better readability.
         default_font.configure(size=default_font.cget("size") + 1)
         text_font.configure(size=text_font.cget("size") + 1)
 
@@ -237,7 +241,7 @@ class ShiftClickApp:
         style.configure("TButton", padding=(10, 8))
         style.configure("TCheckbutton", padding=(0, 4))
         style.configure("TRadiobutton", padding=(0, 4))
-        style.configure("Armed.TCheckbutton", font=bold_font, padding=(0, 4))
+        style.configure("Armed.TCheckbutton", font=heading_font, padding=(0, 4))
         style.configure("TLabelframe", padding=12)
         style.configure("Status.TLabel", font=heading_font, padding=(12, 10))
         style.configure("Section.TLabelframe", padding=14)
@@ -245,6 +249,7 @@ class ShiftClickApp:
         style.configure("StatusCaption.TLabel", foreground="#4b5563")
         style.configure("Stats.TLabel", font=text_font)
         style.configure("Muted.TLabel", foreground="#374151")
+        style.configure("Warning.TLabel", foreground="#9a3412")
         style.configure("StatValue.TLabel", font=heading_font)
         style.configure("TestArea.TButton", font=heading_font, padding=(18, 36))
 
@@ -280,6 +285,14 @@ class ShiftClickApp:
         self.interval_spinbox.bind("<FocusOut>", self._on_interval_changed)
         self.interval_spinbox.bind("<Return>", self._on_interval_changed)
 
+        ttk.Label(
+            controls_frame,
+            text="Warning: 0 ms uses the fastest safe loop and can raise CPU usage.",
+            wraplength=360,
+            justify="left",
+            style="Warning.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
         self.armed_check = ttk.Checkbutton(
             controls_frame,
             text="Armed",
@@ -287,10 +300,10 @@ class ShiftClickApp:
             variable=self.armed_var,
             command=self._on_armed_changed,
         )
-        self.armed_check.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 14))
+        self.armed_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 14))
 
         mode_frame = ttk.LabelFrame(controls_frame, text="Mode", padding=(14, 10))
-        mode_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        mode_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         mode_frame.columnconfigure(0, weight=1)
         mode_frame.columnconfigure(1, weight=1)
 
@@ -314,7 +327,7 @@ class ShiftClickApp:
 
         info_text = "Hotkey: Shift + Left Mouse Button\nToggle mode: plain LMB stops active autoclick"
         info_label = ttk.Label(controls_frame, text=info_text, justify="left", wraplength=360, style="Muted.TLabel")
-        info_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        info_label.grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         status_frame = ttk.LabelFrame(outer, text="Status", style="Section.TLabelframe")
         status_frame.grid(row=0, column=1, sticky="nsew", pady=(0, 10))
@@ -509,9 +522,8 @@ class ShiftClickApp:
 
                 interval_ms = self._get_interval_ms()
                 if interval_ms <= 0:
-                    if self.shutdown_event.is_set():
+                    if self.shutdown_event.wait(0.001):
                         return
-                    time.sleep(0)
                 else:
                     if self.shutdown_event.wait(interval_ms / 1000.0):
                         return
@@ -560,6 +572,7 @@ class ShiftClickApp:
         with self.state_lock:
             self.mode = mode
 
+        self._stop_clicking()
         if mode == "hold":
             self._evaluate_hold_mode()
         self._update_status()
@@ -661,9 +674,10 @@ class ShiftClickApp:
         }
 
         try:
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
             CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except OSError:
-            pass
+        except OSError as exc:
+            messagebox.showwarning(WINDOW_TITLE, f"Settings could not be saved:\n{exc}")
 
     def _stop_listeners(self):
         for listener in (self.keyboard_listener, self.mouse_listener):
@@ -671,8 +685,10 @@ class ShiftClickApp:
                 continue
             try:
                 listener.stop()
-            except Exception:
-                pass
+            except RuntimeError:
+                continue
+            except Exception as exc:
+                print(f"Warning: failed to stop listener {listener!r}: {exc}", file=sys.stderr)
 
     def _on_close(self):
         self._save_config()
@@ -681,7 +697,7 @@ class ShiftClickApp:
         self._stop_listeners()
         self.root.destroy()
 
-    def restore_geometry(self):
+    def _restore_geometry(self):
         if self._loaded_geometry:
             try:
                 self.root.geometry(self._loaded_geometry)
@@ -706,7 +722,6 @@ def main():
         root.destroy()
         return
 
-    app.restore_geometry()
     root.mainloop()
 
 
