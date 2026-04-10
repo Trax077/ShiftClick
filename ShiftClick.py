@@ -8,6 +8,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from ctypes import wintypes
 from collections import deque
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -17,7 +18,7 @@ from typing import SupportsInt
 CONFIG_FILE = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "ShiftClick" / "config.json"
 ICON_FILE = "shiftclick_mouse.ico"
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 APP_AUTHOR = "Trax077"
 DEFAULT_INTERVAL_MS = 50
@@ -27,6 +28,13 @@ DEFAULT_WINDOW_WIDTH = 680
 DEFAULT_WINDOW_HEIGHT = 600
 WINDOW_TITLE = f"ShiftClick {APP_VERSION} by {APP_AUTHOR}"
 TEST_STATS_REFRESH_MS = 100
+INPUT_POLL_INTERVAL_S = 0.01
+TOGGLE_DEBOUNCE_S = 0.2
+SHIFT_CHORD_GRACE_S = 0.25
+ULONG_PTR = wintypes.WPARAM
+# 64-bit value — safe on x64 Windows where ULONG_PTR / WPARAM is 64 bits wide.
+# Tags our own injected clicks so the mouse listener can filter them out.
+SHIFTCLICK_INPUT_TAG = 0x5348434C49434B31
 
 
 class PynputImportError(RuntimeError):
@@ -58,10 +66,59 @@ def compute_status(armed: bool, clicking_active: bool) -> str:
     return "DISARMED"
 
 
-def is_injected_mouse_event(data: object) -> bool:
-    """Return True for mouse events injected by software on Windows."""
-    flags = getattr(data, "flags", 0)
-    return bool(flags & 0x00000001 or flags & 0x00000002)
+def get_mouse_event_extra_info(data: object) -> int:
+    """Read hook extra-info payload when available."""
+    extra_info = getattr(data, "dwExtraInfo", 0)
+    if isinstance(extra_info, int):
+        return extra_info
+    try:
+        return int(extra_info)
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_shiftclick_mouse_event(data: object) -> bool:
+    """Return True only for mouse events emitted by this app.
+
+    Compares the lower 32 bits only.  pynput defines MSLLHOOKSTRUCT.dwExtraInfo
+    as ULONG (32-bit) even on x64, so the upper half of our 64-bit
+    SHIFTCLICK_INPUT_TAG is silently truncated in the hook callback.
+    Masking both sides to 32 bits makes the comparison reliable regardless
+    of whether pynput returns a truncated or a full-width value.
+    """
+    return (get_mouse_event_extra_info(data) & 0xFFFFFFFF) == (SHIFTCLICK_INPUT_TAG & 0xFFFFFFFF)
+
+
+def is_shift_pressed_win32() -> bool:
+    """Read the current Shift state directly from WinAPI."""
+    user32 = getattr(ctypes, "windll", None)
+    if user32 is None:
+        return False
+
+    get_async_key_state = getattr(user32.user32, "GetAsyncKeyState", None)
+    if get_async_key_state is None:
+        return False
+
+    vk_shift_left = 0xA0
+    vk_shift_right = 0xA1
+    return bool(
+        get_async_key_state(vk_shift_left) & 0x8000
+        or get_async_key_state(vk_shift_right) & 0x8000
+    )
+
+
+def is_lmb_pressed_win32() -> bool:
+    """Read the current left mouse button state directly from WinAPI."""
+    user32 = getattr(ctypes, "windll", None)
+    if user32 is None:
+        return False
+
+    get_async_key_state = getattr(user32.user32, "GetAsyncKeyState", None)
+    if get_async_key_state is None:
+        return False
+
+    vk_lbutton = 0x01
+    return bool(get_async_key_state(vk_lbutton) & 0x8000)
 
 
 def normalize_geometry(geometry: object) -> str | None:
@@ -110,7 +167,7 @@ class MOUSEINPUT(ctypes.Structure):
         ("mouseData", ctypes.c_ulong),
         ("dwFlags", ctypes.c_ulong),
         ("time", ctypes.c_ulong),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ("dwExtraInfo", ULONG_PTR),
     ]
 
 
@@ -136,27 +193,16 @@ class WinClicker:
         self._send_input = ctypes.windll.user32.SendInput
 
     def click_left(self):
-        extra = ctypes.c_ulong(0)
         events = (INPUT * 2)()
 
         events[0].type = self.INPUT_MOUSE
         events[0].union.mi = MOUSEINPUT(
-            0,
-            0,
-            0,
-            self.MOUSEEVENTF_LEFTDOWN,
-            0,
-            ctypes.pointer(extra),
+            0, 0, 0, self.MOUSEEVENTF_LEFTDOWN, 0, SHIFTCLICK_INPUT_TAG,
         )
 
         events[1].type = self.INPUT_MOUSE
         events[1].union.mi = MOUSEINPUT(
-            0,
-            0,
-            0,
-            self.MOUSEEVENTF_LEFTUP,
-            0,
-            ctypes.pointer(extra),
+            0, 0, 0, self.MOUSEEVENTF_LEFTUP, 0, SHIFTCLICK_INPUT_TAG,
         )
 
         sent = self._send_input(2, ctypes.byref(events), ctypes.sizeof(INPUT))
@@ -183,13 +229,17 @@ class ShiftClickApp:
         self.mode = DEFAULT_MODE
         self.shift_pressed = False
         self.lmb_pressed = False
+        self.user_lmb_pressed = False   # physical LMB state from mouse listener
         self.clicking_active = False
         self.interval_ms = DEFAULT_INTERVAL_MS
+        self.last_toggle_press_at = 0.0
+        self.last_shift_seen_at = 0.0
 
         self.interval_var = tk.StringVar(value=str(DEFAULT_INTERVAL_MS))
         self.armed_var = tk.BooleanVar(value=DEFAULT_ARMED)
         self.mode_var = tk.StringVar(value=DEFAULT_MODE)
         self.status_var = tk.StringVar(value="DISARMED")
+        self.last_action_var = tk.StringVar(value="Last action: startup")
         self.sent_var = tk.StringVar(value="Sent: 0")
         self.received_var = tk.StringVar(value="Received: 0")
         self.current_cps_var = tk.StringVar(value="Current CPS: 0")
@@ -203,6 +253,7 @@ class ShiftClickApp:
         self.keyboard_listener = None
         self.mouse_listener = None
         self.click_thread = threading.Thread(target=self._click_worker, daemon=True)
+        self.input_thread = threading.Thread(target=self._input_poll_worker, daemon=True)
 
         self._load_config()
         self._configure_styles()
@@ -211,7 +262,8 @@ class ShiftClickApp:
         self._apply_loaded_state()
 
         self.click_thread.start()
-        self._start_global_listeners()
+        self.input_thread.start()
+        self._start_listeners()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(0, self._restore_geometry)
@@ -232,7 +284,6 @@ class ShiftClickApp:
         heading_font = default_font.copy()
         heading_font.configure(size=default_font.cget("size") + 1, weight="bold")
 
-        # Increase the Tk-wide singleton fonts once for better readability.
         default_font.configure(size=default_font.cget("size") + 1)
         text_font.configure(size=text_font.cget("size") + 1)
 
@@ -325,8 +376,15 @@ class ShiftClickApp:
         )
         self.toggle_radio.grid(row=0, column=1, sticky="w")
 
-        info_text = "Hotkey: Shift + Left Mouse Button\nToggle mode: plain LMB stops active autoclick"
-        info_label = ttk.Label(controls_frame, text=info_text, justify="left", wraplength=360, style="Muted.TLabel")
+        hold_info = "Hold: hold Shift + LMB to autoclick, release either to stop."
+        toggle_info = "Toggle: Shift + LMB to start, plain LMB to stop."
+        info_label = ttk.Label(
+            controls_frame,
+            text=f"{hold_info}\n{toggle_info}",
+            justify="left",
+            wraplength=360,
+            style="Muted.TLabel",
+        )
         info_label.grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         status_frame = ttk.LabelFrame(outer, text="Status", style="Section.TLabelframe")
@@ -347,8 +405,16 @@ class ShiftClickApp:
         )
         status_label.grid(row=1, column=0, sticky="ew")
 
+        ttk.Label(
+            status_frame,
+            textvariable=self.last_action_var,
+            style="Muted.TLabel",
+            wraplength=240,
+            justify="left",
+        ).grid(row=2, column=0, sticky="ew", pady=(8, 0))
+
         stats_frame = ttk.LabelFrame(status_frame, text="Live Stats", padding=(12, 10))
-        stats_frame.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+        stats_frame.grid(row=3, column=0, sticky="ew", pady=(14, 0))
         stats_frame.columnconfigure(0, weight=1)
 
         self.sent_label = ttk.Label(stats_frame, textvariable=self.sent_var, style="Stats.TLabel", width=22, anchor="w")
@@ -398,18 +464,35 @@ class ShiftClickApp:
         self._set_mode(self.mode_var.get())
         self._update_status()
 
-    def _start_global_listeners(self):
+    def _start_listeners(self):
+        """Start keyboard and mouse listeners.
+
+        Keyboard listener: fast, event-driven Shift detection.
+
+        Mouse listener: tracks the PHYSICAL LMB state independently of our
+        own injected clicks.  The win32_event_filter suppresses events tagged
+        with SHIFTCLICK_INPUT_TAG before they reach on_click, so the callback
+        only fires for genuine user input.  This solves two problems:
+          - Hold mode: our injected LMB-Up cannot clear user_lmb_pressed,
+            so polling no longer sees a false "button released" while the
+            physical button is still held.
+          - Toggle mode: plain LMB stop is detected reliably without being
+            confused with injected LMB-Down events.
+        """
         self.keyboard_listener = self.keyboard_mod.Listener(
             on_press=self._on_key_press,
             on_release=self._on_key_release,
         )
         self.mouse_listener = self.mouse_mod.Listener(
-            on_click=self._on_global_click,
+            on_click=self._on_physical_mouse_click,
             win32_event_filter=self._mouse_event_filter,
         )
-
         self.keyboard_listener.start()
         self.mouse_listener.start()
+
+    # ------------------------------------------------------------------
+    # Keyboard listener callbacks
+    # ------------------------------------------------------------------
 
     def _is_shift_key(self, key):
         return key in {
@@ -421,8 +504,15 @@ class ShiftClickApp:
     def _on_key_press(self, key):
         if self._is_shift_key(key):
             with self.state_lock:
+                already_pressed = self.shift_pressed
                 self.shift_pressed = True
-            self._evaluate_hold_mode()
+                self.last_shift_seen_at = time.monotonic()
+            if not already_pressed:
+                # Suppress key-repeat events: Windows fires repeated WM_KEYDOWN
+                # while a key is held (~500 ms initial delay then ~30 Hz).
+                # Each repeat would call _evaluate_hold_mode with a stale
+                # lmb_pressed=False (set by injected LMB-Up), stopping clicking.
+                self._evaluate_hold_mode()
 
     def _on_key_release(self, key):
         if self._is_shift_key(key):
@@ -430,78 +520,147 @@ class ShiftClickApp:
                 self.shift_pressed = False
             self._evaluate_hold_mode()
 
-    def _mouse_event_filter(self, msg, data):
-        return not is_injected_mouse_event(data)
+    # ------------------------------------------------------------------
+    # Mouse listener callbacks
+    # ------------------------------------------------------------------
 
-    def _on_global_click(self, x, y, button, pressed):
+    def _mouse_event_filter(self, msg, data):
+        """Block our own injected clicks; only physical events reach on_click."""
+        return not is_shiftclick_mouse_event(data)
+
+    def _on_physical_mouse_click(self, x, y, button, pressed):
+        """Called only for physical (non-injected) LMB events."""
         if button != self.mouse_mod.Button.left:
             return
 
-        if pressed:
-            self._handle_lmb_press()
-        else:
-            self._handle_lmb_release()
-
-    def _handle_lmb_press(self):
         with self.state_lock:
-            self.lmb_pressed = True
-            armed = self.armed
+            self.user_lmb_pressed = pressed
             mode = self.mode
-            shift_pressed = self.shift_pressed
             clicking_active = self.clicking_active
 
-        if not armed:
-            return
+        if mode == "hold":
+            # Delegate to the shared evaluator which checks Shift + user_lmb_pressed.
+            self._evaluate_hold_mode()
+        elif mode == "toggle" and pressed and clicking_active:
+            # Plain LMB press while clicking → stop (if Shift is not active).
+            if not self._is_shift_active():
+                self._stop_clicking(reason="toggle lmb stop")
+
+    # ------------------------------------------------------------------
+    # Shared input helpers
+    # ------------------------------------------------------------------
+
+    def _is_shift_active(self):
+        with self.state_lock:
+            listener_shift_pressed = self.shift_pressed
+        return listener_shift_pressed or is_shift_pressed_win32()
+
+    def _is_shift_hotkey_active(self, now, shift_pressed=None):
+        with self.state_lock:
+            last_shift_seen_at = self.last_shift_seen_at
+            listener_shift_pressed = self.shift_pressed
+
+        if shift_pressed is None:
+            shift_pressed = listener_shift_pressed or is_shift_pressed_win32()
+
+        return shift_pressed or (now - last_shift_seen_at) <= SHIFT_CHORD_GRACE_S
+
+    # ------------------------------------------------------------------
+    # Poll worker (Shift + LMB via WinAPI — fallback / start detection)
+    # ------------------------------------------------------------------
+
+    def _sync_polled_input(self, shift_pressed, lmb_pressed):
+        now = time.monotonic()
+        with self.state_lock:
+            previous_lmb_pressed = self.lmb_pressed
+            self.shift_pressed = shift_pressed
+            if shift_pressed:
+                self.last_shift_seen_at = now
+            self.lmb_pressed = lmb_pressed
+            armed = self.armed
+            mode = self.mode
+            clicking_active = self.clicking_active
+            can_toggle = (now - self.last_toggle_press_at) >= TOGGLE_DEBOUNCE_S
 
         if mode == "hold":
-            if shift_pressed:
-                self._start_clicking()
-            return
-
-        if shift_pressed:
             if clicking_active:
-                self._stop_clicking()
+                # Physical LMB state comes from the mouse listener (user_lmb_pressed).
+                # GetAsyncKeyState(VK_LBUTTON) is unreliable while we are injecting:
+                # our own LMB-Up clears the bit even when the physical button is held.
+                # LMB release is therefore handled by _on_physical_mouse_click →
+                # _evaluate_hold_mode.  Here we only watch Shift + Armed.
+                if not armed or not shift_pressed:
+                    self._stop_clicking(reason="hold poll stop")
             else:
-                self._start_clicking()
+                if armed and shift_pressed and lmb_pressed:
+                    self._start_clicking(reason="hold poll start")
             return
 
-        if clicking_active:
-            self._stop_clicking()
+        # Toggle mode — only detect the START edge here.
+        # STOP is handled reliably by _on_physical_mouse_click (mouse listener),
+        # which filters out our own injected LMB-Down events.
+        if lmb_pressed and not previous_lmb_pressed and not clicking_active:
+            if not armed:
+                return
+            if self._is_shift_hotkey_active(now, shift_pressed=shift_pressed):
+                if not can_toggle:
+                    return
+                with self.state_lock:
+                    self.last_toggle_press_at = now
+                self._start_clicking(reason="toggle hotkey start")
 
-    def _handle_lmb_release(self):
-        with self.state_lock:
-            self.lmb_pressed = False
-        self._evaluate_hold_mode()
+    def _input_poll_worker(self):
+        while not self.shutdown_event.is_set():
+            shift_pressed = is_shift_pressed_win32()
+            lmb_pressed = is_lmb_pressed_win32()
+            self._sync_polled_input(shift_pressed, lmb_pressed)
+
+            if self.shutdown_event.wait(INPUT_POLL_INTERVAL_S):
+                return
+
+    # ------------------------------------------------------------------
+    # Hold-mode state evaluator (called from both listeners)
+    # ------------------------------------------------------------------
 
     def _evaluate_hold_mode(self):
         with self.state_lock:
             armed = self.armed
             mode = self.mode
-            shift_pressed = self.shift_pressed
-            lmb_pressed = self.lmb_pressed
+            user_lmb = self.user_lmb_pressed   # physical state from mouse listener
+
+        shift_pressed = self._is_shift_active()
 
         if mode != "hold":
             return
 
-        if armed and shift_pressed and lmb_pressed:
-            self._start_clicking()
+        if armed and shift_pressed and user_lmb:
+            self._start_clicking(reason="hold evaluate start")
         else:
-            self._stop_clicking()
+            self._stop_clicking(reason="hold evaluate stop")
 
-    def _start_clicking(self):
+    # ------------------------------------------------------------------
+    # Clicking state machine
+    # ------------------------------------------------------------------
+
+    def _set_last_action(self, text):
+        self.last_action_var.set(f"Last action: {text}")
+
+    def _start_clicking(self, reason="start"):
         with self.state_lock:
             if self.clicking_active or not self.armed:
                 return
             self.clicking_active = True
             self.clicking_event.set()
+        self.gui_queue.put(("action", reason))
         self._queue_status_update()
 
-    def _stop_clicking(self):
+    def _stop_clicking(self, reason="stop"):
         with self.state_lock:
             if not self.clicking_active:
                 return
             self.clicking_active = False
             self.clicking_event.clear()
+        self.gui_queue.put(("action", reason))
         self._queue_status_update()
 
     def _click_worker(self):
@@ -513,8 +672,9 @@ class ShiftClickApp:
                 try:
                     self.clicker.click_left()
                 except Exception as exc:
+                    self.gui_queue.put(("action", f"stop: sendinput error {exc}"))
                     self.gui_queue.put(("error", f"Failed to send click input:\n{exc}"))
-                    self._stop_clicking()
+                    self._stop_clicking(reason="sendinput error")
                     break
 
                 with self.state_lock:
@@ -556,7 +716,7 @@ class ShiftClickApp:
             armed = self.armed
 
         if not armed:
-            self._stop_clicking()
+            self._stop_clicking(reason="armed disabled")
         else:
             self._evaluate_hold_mode()
 
@@ -572,7 +732,7 @@ class ShiftClickApp:
         with self.state_lock:
             self.mode = mode
 
-        self._stop_clicking()
+        self._stop_clicking(reason="mode changed")
         if mode == "hold":
             self._evaluate_hold_mode()
         self._update_status()
@@ -596,11 +756,17 @@ class ShiftClickApp:
 
             if item_type == "status":
                 self._update_status()
+            elif item_type == "action":
+                self._set_last_action(payload)
             elif item_type == "error":
                 messagebox.showerror(WINDOW_TITLE, payload)
 
         if not self.shutdown_event.is_set():
             self.root.after(50, self._process_gui_queue)
+
+    # ------------------------------------------------------------------
+    # Test area
+    # ------------------------------------------------------------------
 
     def _on_test_area_click(self, _event):
         now = time.monotonic()
@@ -650,6 +816,10 @@ class ShiftClickApp:
         self.peak_cps = 0
         self._update_test_stat_labels(current_cps=0)
 
+    # ------------------------------------------------------------------
+    # Config persistence
+    # ------------------------------------------------------------------
+
     def _load_config(self):
         try:
             data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -668,7 +838,7 @@ class ShiftClickApp:
 
     def _save_config(self):
         data = {
-            "interval_ms": self._sanitize_interval(),
+            "interval_ms": normalize_interval(self.interval_var.get()),
             "mode": self.mode_var.get(),
             "geometry": self.root.geometry(),
         }
@@ -678,6 +848,10 @@ class ShiftClickApp:
             CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except OSError as exc:
             messagebox.showwarning(WINDOW_TITLE, f"Settings could not be saved:\n{exc}")
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
 
     def _stop_listeners(self):
         for listener in (self.keyboard_listener, self.mouse_listener):
@@ -698,11 +872,16 @@ class ShiftClickApp:
         self.root.destroy()
 
     def _restore_geometry(self):
-        if self._loaded_geometry:
-            try:
-                self.root.geometry(self._loaded_geometry)
-            except tk.TclError:
-                pass
+        if not self._loaded_geometry:
+            return
+        # Window is non-resizable; restore only the position part (+x+y).
+        _, sep, position_part = self._loaded_geometry.partition("+")
+        if not sep:
+            return
+        try:
+            self.root.geometry(f"+{position_part}")
+        except tk.TclError:
+            pass
 
 
 def main():

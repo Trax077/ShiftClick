@@ -5,7 +5,7 @@ a = Analysis(
     ['ShiftClick.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('shiftclick_mouse.ico', '.')],
     hiddenimports=['pynput.keyboard', 'pynput.mouse'],
     hookspath=[],
     hooksconfig={},

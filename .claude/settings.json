@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pip install pytest -q)",
+      "Bash(python -m pytest test_ShiftClick.py -v)",
+      "Bash(Get-Content d:/dev/ShiftClick/build.ps1)",
+      "Bash(Format-Hex)",
+      "Bash(powershell -Command \"Get-Content 'd:\\\\dev\\\\ShiftClick\\\\build.ps1' | Out-Null; Write-Host 'Parse OK'\")"
+    ]
+  }
+}
